@@ -8,6 +8,7 @@ set -euo pipefail
 # =============================================================================
 
 HARNESS_DIR=".harness"
+HISTORY_FILE="$HARNESS_DIR/history.log"
 LOG_FILE="$HARNESS_DIR/run.log"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 
@@ -17,14 +18,17 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
 info()  { echo -e "${BLUE}[info]${NC}  $*"; }
-ok()    { echo -e "${GREEN}[ok]${NC}    $*"; }
-warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
-err()   { echo -e "${RED}[error]${NC} $*" >&2; }
+ok()    { echo -e "${GREEN}  ✓${NC}  $*"; }
+warn()  { echo -e "${YELLOW}  !${NC}  $*"; }
+err()   { echo -e "${RED}  ✗${NC}  $*" >&2; }
 phase() { echo -e "\n${BOLD}${CYAN}════════ $* ════════${NC}\n"; }
+dim()   { echo -e "${DIM}$*${NC}"; }
 
 log() {
   local msg="[$(date +"%H:%M:%S")] $*"
@@ -41,6 +45,7 @@ Options:
   --skip-plan       Skip Structurer + Planner, jump to Builder using existing plan
   --builder-only    Run only the Builder phase
   --qa-only         Run only the QA phase against current state
+  --quiet           Suppress live agent output (only save to files)
   --clean           Remove .harness/ directory and exit
   -h, --help        Show this help message
 
@@ -60,6 +65,7 @@ SKIP_PLAN=false
 BUILDER_ONLY=false
 QA_ONLY=false
 CLEAN=false
+QUIET=false
 TASK=""
 
 while [[ $# -gt 0 ]]; do
@@ -68,6 +74,7 @@ while [[ $# -gt 0 ]]; do
     --skip-plan)     SKIP_PLAN=true; shift ;;
     --builder-only)  BUILDER_ONLY=true; shift ;;
     --qa-only)       QA_ONLY=true; shift ;;
+    --quiet)         QUIET=true; shift ;;
     --clean)         CLEAN=true; shift ;;
     -h|--help)       usage ;;
     -*)              err "Unknown option: $1"; usage ;;
@@ -86,22 +93,203 @@ if $CLEAN; then
   exit 0
 fi
 
-# --- Validate ----------------------------------------------------------------
+# --- Validate claude CLI ----------------------------------------------------
 if ! command -v claude &>/dev/null; then
   err "Claude Code CLI not found. Install it first: https://docs.anthropic.com/en/docs/claude-code"
   exit 1
 fi
 
-if [[ -z "$TASK" && ! ($SKIP_PLAN == true || $BUILDER_ONLY == true || $QA_ONLY == true) ]]; then
-  err "No task description provided."
-  usage
+# --- History helpers ---------------------------------------------------------
+history_add() {
+  mkdir -p "$HARNESS_DIR"
+  echo "$(date +"%Y-%m-%d %H:%M") | $1 | $2" >> "$HISTORY_FILE"
+}
+
+history_show() {
+  if [[ -f "$HISTORY_FILE" ]]; then
+    echo ""
+    echo -e "  ${BOLD}Recent tasks${NC}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────${NC}"
+    tail -10 "$HISTORY_FILE" | nl -ba -w2 -s'  ' | while IFS= read -r line; do
+      echo -e "  ${DIM}$line${NC}"
+    done
+    echo ""
+  else
+    dim "  No task history yet."
+    echo ""
+  fi
+}
+
+# --- Artifact status ---------------------------------------------------------
+artifact_status() {
+  local file="$1"
+  local label="$2"
+  if [[ -f "$file" ]]; then
+    local size
+    size=$(wc -c < "$file" | tr -d ' ')
+    local modified
+    modified=$(date -r "$file" +"%H:%M" 2>/dev/null || stat -c '%y' "$file" 2>/dev/null | cut -d. -f1)
+    echo -e "    ${GREEN}●${NC} $label ${DIM}(${size}B, $modified)${NC}"
+  else
+    echo -e "    ${DIM}○ $label${NC}"
+  fi
+}
+
+show_status() {
+  echo ""
+  echo -e "  ${BOLD}Artifacts${NC}"
+  artifact_status "$HARNESS_DIR/structure.md"    "structure.md"
+  artifact_status "$HARNESS_DIR/plan.md"         "plan.md"
+  artifact_status "$HARNESS_DIR/build-result.md" "build-result.md"
+  artifact_status "$HARNESS_DIR/qa-report.md"    "qa-report.md"
+  echo ""
+  if [[ -f "$HARNESS_DIR/task.txt" ]]; then
+    echo -e "  ${BOLD}Last task:${NC} ${DIM}$(cat "$HARNESS_DIR/task.txt")${NC}"
+    echo ""
+  fi
+}
+
+# --- Banner ------------------------------------------------------------------
+show_banner() {
+  echo ""
+  echo -e "  ${BOLD}${CYAN}┌─────────────────────────────────────┐${NC}"
+  echo -e "  ${BOLD}${CYAN}│${NC}   ${BOLD}dev-harness${NC}  ${DIM}multi-agent pipeline${NC}  ${BOLD}${CYAN}│${NC}"
+  echo -e "  ${BOLD}${CYAN}└─────────────────────────────────────┘${NC}"
+  echo -e "  ${DIM}$(basename "$(pwd)")${NC}"
+}
+
+# --- Interactive mode --------------------------------------------------------
+run_interactive() {
+  show_banner
+  show_status
+
+  while true; do
+    echo -e "  ${BOLD}What do you want to do?${NC}"
+    echo ""
+    echo -e "    ${BOLD}1${NC}  New task            ${DIM}full pipeline${NC}"
+    echo -e "    ${BOLD}2${NC}  Plan only           ${DIM}structure + plan, no code changes${NC}"
+    echo -e "    ${BOLD}3${NC}  Build from plan     ${DIM}execute existing plan${NC}"
+    echo -e "    ${BOLD}4${NC}  QA only             ${DIM}review current changes${NC}"
+    echo -e "    ${BOLD}5${NC}  View artifact        ${DIM}read an output file${NC}"
+    echo -e "    ${BOLD}6${NC}  History             ${DIM}past tasks${NC}"
+    echo -e "    ${BOLD}7${NC}  Clean               ${DIM}wipe .harness/${NC}"
+    echo -e "    ${BOLD}q${NC}  Quit"
+    echo ""
+    echo -ne "  ${CYAN}>${NC} "
+    read -r choice
+
+    case "$choice" in
+      1)
+        echo ""
+        echo -ne "  ${BOLD}Describe the task:${NC} "
+        read -r TASK
+        if [[ -z "$TASK" ]]; then warn "No task entered."; echo ""; continue; fi
+        history_add "full" "$TASK"
+        return 0  # proceed to full pipeline
+        ;;
+      2)
+        echo ""
+        echo -ne "  ${BOLD}Describe the task:${NC} "
+        read -r TASK
+        if [[ -z "$TASK" ]]; then warn "No task entered."; echo ""; continue; fi
+        PLAN_ONLY=true
+        history_add "plan-only" "$TASK"
+        return 0
+        ;;
+      3)
+        if [[ ! -f "$HARNESS_DIR/plan.md" ]]; then
+          warn "No plan found. Run a plan first."
+          echo ""
+          continue
+        fi
+        SKIP_PLAN=true
+        if [[ -f "$HARNESS_DIR/task.txt" ]]; then
+          TASK=$(cat "$HARNESS_DIR/task.txt")
+        fi
+        history_add "build" "$TASK"
+        return 0
+        ;;
+      4)
+        QA_ONLY=true
+        if [[ -f "$HARNESS_DIR/task.txt" ]]; then
+          TASK=$(cat "$HARNESS_DIR/task.txt")
+        fi
+        history_add "qa" "$TASK"
+        return 0
+        ;;
+      5)
+        echo ""
+        echo -e "    ${BOLD}a${NC}  structure.md"
+        echo -e "    ${BOLD}b${NC}  plan.md"
+        echo -e "    ${BOLD}c${NC}  build-result.md"
+        echo -e "    ${BOLD}d${NC}  qa-report.md"
+        echo -e "    ${BOLD}e${NC}  run.log"
+        echo ""
+        echo -ne "  ${CYAN}>${NC} "
+        read -r artifact_choice
+        local artifact_file=""
+        case "$artifact_choice" in
+          a) artifact_file="$HARNESS_DIR/structure.md" ;;
+          b) artifact_file="$HARNESS_DIR/plan.md" ;;
+          c) artifact_file="$HARNESS_DIR/build-result.md" ;;
+          d) artifact_file="$HARNESS_DIR/qa-report.md" ;;
+          e) artifact_file="$LOG_FILE" ;;
+          *) warn "Invalid choice."; echo ""; continue ;;
+        esac
+        if [[ -f "$artifact_file" ]]; then
+          echo ""
+          echo -e "  ${DIM}─── $artifact_file ───${NC}"
+          echo ""
+          # use less if available and output is large, otherwise cat
+          if [[ $(wc -l < "$artifact_file") -gt 40 ]] && command -v less &>/dev/null; then
+            less -R "$artifact_file"
+          else
+            cat "$artifact_file"
+          fi
+          echo ""
+          echo -e "  ${DIM}─── end ───${NC}"
+        else
+          warn "File not found: $artifact_file"
+        fi
+        echo ""
+        ;;
+      6)
+        history_show
+        ;;
+      7)
+        if [[ -d "$HARNESS_DIR" ]]; then
+          rm -rf "$HARNESS_DIR"
+          ok "Cleaned $HARNESS_DIR"
+          mkdir -p "$HARNESS_DIR"
+        else
+          info "Nothing to clean."
+        fi
+        echo ""
+        ;;
+      q|Q|quit|exit)
+        echo ""
+        dim "  bye."
+        echo ""
+        exit 0
+        ;;
+      *)
+        warn "Pick 1-7 or q."
+        echo ""
+        ;;
+    esac
+  done
+}
+
+# --- Launch interactive mode if no task/flags given --------------------------
+if [[ -z "$TASK" && $PLAN_ONLY == false && $SKIP_PLAN == false && $BUILDER_ONLY == false && $QA_ONLY == false ]]; then
+  run_interactive
 fi
 
 # --- Setup .harness/ ---------------------------------------------------------
 mkdir -p "$HARNESS_DIR"
 echo "# Harness run: $TIMESTAMP" > "$LOG_FILE"
 log "Task: $TASK"
-log "Flags: plan_only=$PLAN_ONLY skip_plan=$SKIP_PLAN builder_only=$BUILDER_ONLY qa_only=$QA_ONLY"
+log "Flags: plan_only=$PLAN_ONLY skip_plan=$SKIP_PLAN builder_only=$BUILDER_ONLY qa_only=$QA_ONLY quiet=$QUIET"
 
 # --- Build codebase preamble (auto-detect stack) ----------------------------
 build_preamble() {
@@ -165,18 +353,42 @@ run_phase() {
 
   local start_time=$SECONDS
 
-  if claude -p \
-    --dangerously-skip-permissions \
-    "$prompt" \
-    > "$output_file" 2>>"$LOG_FILE"; then
-    local elapsed=$(( SECONDS - start_time ))
-    ok "$name completed in ${elapsed}s — output: $output_file"
-    log "$name completed in ${elapsed}s"
+  if $QUIET; then
+    # Silent mode: output only to file (original behavior)
+    if claude -p \
+      --dangerously-skip-permissions \
+      "$prompt" \
+      > "$output_file" 2>>"$LOG_FILE"; then
+      local elapsed=$(( SECONDS - start_time ))
+      ok "$name completed in ${elapsed}s — output: $output_file"
+      log "$name completed in ${elapsed}s"
+    else
+      local elapsed=$(( SECONDS - start_time ))
+      err "$name failed after ${elapsed}s. Check $LOG_FILE for details."
+      log "$name FAILED after ${elapsed}s"
+      exit 1
+    fi
   else
-    local elapsed=$(( SECONDS - start_time ))
-    err "$name failed after ${elapsed}s. Check $LOG_FILE for details."
-    log "$name FAILED after ${elapsed}s"
-    exit 1
+    # Live mode: stream output to terminal AND save to file
+    echo ""
+    info "─── $name output ───"
+    echo ""
+    if claude -p \
+      --dangerously-skip-permissions \
+      "$prompt" \
+      2>>"$LOG_FILE" | tee "$output_file"; then
+      echo ""
+      info "─── end $name output ───"
+      local elapsed=$(( SECONDS - start_time ))
+      ok "$name completed in ${elapsed}s — output saved: $output_file"
+      log "$name completed in ${elapsed}s"
+    else
+      echo ""
+      local elapsed=$(( SECONDS - start_time ))
+      err "$name failed after ${elapsed}s. Check $LOG_FILE for details."
+      log "$name FAILED after ${elapsed}s"
+      exit 1
+    fi
   fi
 }
 
@@ -462,6 +674,16 @@ if [[ -n "$TASK" ]]; then
   echo "$TASK" > "$HARNESS_DIR/task.txt"
 elif [[ -f "$HARNESS_DIR/task.txt" ]]; then
   TASK=$(cat "$HARNESS_DIR/task.txt")
+fi
+
+# Log to history if invoked from CLI (interactive mode logs its own)
+if [[ -n "$TASK" && ! -f "$HARNESS_DIR/.interactive" ]]; then
+  local_mode="full"
+  $PLAN_ONLY && local_mode="plan-only"
+  $SKIP_PLAN && local_mode="build"
+  $BUILDER_ONLY && local_mode="builder-only"
+  $QA_ONLY && local_mode="qa"
+  history_add "$local_mode" "$TASK"
 fi
 
 if $QA_ONLY; then
