@@ -1,0 +1,9 @@
+# Harness run log (always ignore — noisy, regenerated each run)
+.harness/run.log
+
+# Harness artifacts — uncomment to ignore all working state
+# .harness/structure.md
+# .harness/plan.md
+# .harness/build-result.md
+# .harness/qa-report.md
+# .harness/task.txt
