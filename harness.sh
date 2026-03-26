@@ -167,6 +167,13 @@ for i, f in enumerate(files, 1):
         verdict = s.get('qa_verdict', '--')
         started = s.get('started', '?')
 
+        # Total tokens
+        tokens = sum(p.get('total_tokens', 0) for p in s.get('phases', []))
+        if tokens >= 1000:
+            tok_str = f'{tokens / 1000:.1f}K'
+        else:
+            tok_str = str(tokens)
+
         # Format duration
         if dur >= 60:
             dur_str = f'{dur // 60}m{dur % 60:02.0f}s'
@@ -187,7 +194,7 @@ for i, f in enumerate(files, 1):
         else:
             v_color = '\033[2m'
 
-        print(f'  \033[2m{i:>2}\033[0m  {date_part} {time_part}  \033[1m{mode:<11}\033[0m {dur_str:>6}  \033[2m\${cost:.2f}\033[0m  {v_color}{verdict:<4}\033[0m  \033[2m{task}\033[0m')
+        print(f'  \033[2m{i:>2}\033[0m  {date_part} {time_part}  \033[1m{mode:<11}\033[0m {dur_str:>6}  {tok_str:>6}tok  \033[2m\${cost:.2f}\033[0m  {v_color}{verdict:<4}\033[0m  \033[2m{task}\033[0m')
     except: pass
 " 2>/dev/null
 
@@ -951,14 +958,20 @@ else
   DURATION_FMT="${TOTAL_ELAPSED}s"
 fi
 
-# Read total cost from session
-TOTAL_COST=$(python3 -c "
+# Read total cost and tokens from session
+read -r TOTAL_COST TOTAL_TOKENS < <(python3 -c "
 import json
 try:
     with open('$SESSION_FILE') as f:
         s = json.load(f)
-    print(f\"\${s.get('total_cost_usd', 0):.4f}\")
-except: print('\$0.0000')
+    cost = s.get('total_cost_usd', 0)
+    tokens = sum(p.get('total_tokens', 0) for p in s.get('phases', []))
+    if tokens >= 1000:
+        t_str = f'{tokens / 1000:.1f}K'
+    else:
+        t_str = str(tokens)
+    print(f'\${cost:.4f} {t_str}')
+except: print('\$0.0000 0')
 " 2>/dev/null)
 
 # Colorize QA verdict
@@ -973,6 +986,7 @@ echo -e "  ${WHITE}│${NC}                                                ${WHI
 echo -e "  ${WHITE}│${NC}  ${BOLD}Task:${NC}    $(printf '%-39s' "$TASK" | head -c 39)  ${WHITE}│${NC}"
 echo -e "  ${WHITE}│${NC}  ${BOLD}Phases:${NC}  $TOTAL_PHASES/$TOTAL_PHASES      ${BOLD}Time:${NC} $(printf '%-13s' "$DURATION_FMT")  ${WHITE}│${NC}"
 echo -e "  ${WHITE}│${NC}  ${BOLD}Cost:${NC}    $(printf '%-12s' "$TOTAL_COST")${BOLD}QA:${NC}   ${QA_COLOR}$(printf '%-13s' "$QA_VERDICT")${NC}  ${WHITE}│${NC}"
+echo -e "  ${WHITE}│${NC}  ${BOLD}Tokens:${NC}  $(printf '%-12s' "$TOTAL_TOKENS")                         ${WHITE}│${NC}"
 echo -e "  ${WHITE}│${NC}                                                ${WHITE}│${NC}"
 
 # Artifact dots

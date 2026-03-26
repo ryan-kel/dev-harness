@@ -74,6 +74,7 @@ def main():
     final_text = ""
     duration_ms = 0
     cost_usd = 0.0
+    usage = {}
     tool_count = 0
     text_started = False
 
@@ -126,6 +127,7 @@ def main():
             final_text = event.get("result", "")
             duration_ms = event.get("duration_ms", 0)
             cost_usd = event.get("total_cost_usd", 0.0)
+            usage = event.get("usage", {})
 
         # Ignore system, user, rate_limit_event types silently
 
@@ -139,6 +141,13 @@ def main():
         with open(output_file, "w") as f:
             f.write(final_text)
 
+    # Compute token totals
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_create = usage.get("cache_creation_input_tokens", 0)
+    total_tokens = input_tokens + output_tokens + cache_read + cache_create
+
     # Append phase data to session ledger
     if session_file:
         phase_data = {
@@ -146,6 +155,11 @@ def main():
             "duration_s": round(duration_ms / 1000, 1),
             "cost_usd": round(cost_usd, 6),
             "tools_used": tool_count,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read,
+            "cache_creation_tokens": cache_create,
+            "total_tokens": total_tokens,
         }
         try:
             if os.path.exists(session_file):
@@ -161,11 +175,27 @@ def main():
         except (json.JSONDecodeError, IOError):
             pass  # don't break the pipeline over session bookkeeping
 
-    # Print phase cost summary
+    # Print phase summary
     duration_s = round(duration_ms / 1000, 1)
     if duration_ms > 0:
+        # Format token count with K suffix for readability
+        def fmt_tokens(n):
+            if n >= 1000:
+                return f"{n / 1000:.1f}K"
+            return str(n)
+
+        token_parts = []
+        if input_tokens:
+            token_parts.append(f"in:{fmt_tokens(input_tokens)}")
+        if output_tokens:
+            token_parts.append(f"out:{fmt_tokens(output_tokens)}")
+        if cache_read:
+            token_parts.append(f"cache:{fmt_tokens(cache_read)}")
+        token_str = " ".join(token_parts)
+
         print(
             f"\n  {DIM}{duration_s}s | ${cost_usd:.4f} | "
+            f"{fmt_tokens(total_tokens)} tokens ({token_str}) | "
             f"{tool_count} tool calls{NC}",
             flush=True,
         )
