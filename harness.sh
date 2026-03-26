@@ -421,7 +421,9 @@ run_interactive() {
 }
 
 # --- Launch interactive mode if no task/flags given --------------------------
+INTERACTIVE=false
 if [[ -z "$TASK" && $PLAN_ONLY == false && $SKIP_PLAN == false && $BUILDER_ONLY == false && $QA_ONLY == false ]]; then
+  INTERACTIVE=true
   run_interactive
 fi
 
@@ -1024,3 +1026,19 @@ show_next_steps() {
 }
 
 show_next_steps
+
+# --- Return to interactive menu if we came from there -------------------------
+if $INTERACTIVE; then
+  echo -e "  ${DIM}Press enter to return to menu, or q to quit${NC}"
+  echo -ne "  ${BRIGHT_CYAN}>${NC} "
+  read -r post_choice
+  if [[ "$post_choice" == "q" || "$post_choice" == "Q" || "$post_choice" == "quit" ]]; then
+    echo ""
+    dim "bye."
+    echo ""
+    exit 0
+  fi
+
+  # Re-exec with clean state to return to interactive menu
+  exec "$SCRIPT_DIR/harness.sh"
+fi
