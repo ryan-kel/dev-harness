@@ -7,7 +7,7 @@ set -euo pipefail
 # Communication via markdown artifacts in .harness/
 # =============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 HARNESS_DIR=".harness"
 SESSIONS_DIR="$HARNESS_DIR/sessions"
 HISTORY_FILE="$HARNESS_DIR/history.log"
@@ -37,6 +37,7 @@ warn()  { echo -e "  ${YELLOW}!${NC}  $*"; }
 err()   { echo -e "  ${BRIGHT_RED}✗${NC}  $*" >&2; }
 phase() { echo -e "\n  ${WHITE}════${NC} ${BOLD}${BRIGHT_CYAN}$*${NC} ${WHITE}════${NC}\n"; }
 dim()   { echo -e "  ${DIM}$*${NC}"; }
+ts()    { echo -e "  ${DIM}$(date +"%H:%M:%S")${NC}  $*"; }
 
 log() {
   local msg="[$(date +"%H:%M:%S")] $*"
@@ -54,6 +55,7 @@ Options:
   --builder-only    Run only the Builder phase
   --qa-only         Run only the QA phase against current state
   --quiet           Suppress live agent output (only save to files)
+  --fresh           Force re-run structurer even if recent structure exists
   --clean           Remove .harness/ directory and exit
   -h, --help        Show this help message
 
@@ -74,6 +76,7 @@ BUILDER_ONLY=false
 QA_ONLY=false
 CLEAN=false
 QUIET=false
+FRESH=false
 TASK=""
 
 while [[ $# -gt 0 ]]; do
@@ -83,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --builder-only)  BUILDER_ONLY=true; shift ;;
     --qa-only)       QA_ONLY=true; shift ;;
     --quiet)         QUIET=true; shift ;;
+    --fresh)         FRESH=true; shift ;;
     --clean)         CLEAN=true; shift ;;
     -h|--help)       usage ;;
     -*)              err "Unknown option: $1"; usage ;;
@@ -252,7 +256,16 @@ run_interactive() {
   while true; do
     echo -e "  ${BOLD}What do you want to do?${NC}"
     echo ""
-    echo -e "    ${BRIGHT_CYAN}1${NC}  ${BOLD}New task${NC}            ${DIM}full pipeline${NC}"
+    # Check structure freshness for hints
+    local struct_hint=""
+    if [[ -f "$HARNESS_DIR/structure.md" ]]; then
+      local struct_age=$(( ( $(date +%s) - $(stat -c %Y "$HARNESS_DIR/structure.md") ) / 60 ))
+      if [[ "$struct_age" -lt 60 ]]; then
+        struct_hint=" ${DIM}(reusing structure)${NC}"
+      fi
+    fi
+
+    echo -e "    ${BRIGHT_CYAN}1${NC}  ${BOLD}New task${NC}            ${DIM}full pipeline${NC}${struct_hint}"
     echo -e "    ${BRIGHT_CYAN}2${NC}  ${BOLD}Plan only${NC}           ${DIM}structure + plan, no code changes${NC}"
 
     if $has_plan; then
@@ -281,6 +294,13 @@ run_interactive() {
         echo -ne "  ${BOLD}Describe the task:${NC}\n\n  ${BRIGHT_CYAN}>${NC} "
         read -r TASK
         if [[ -z "$TASK" ]]; then warn "No task entered."; echo ""; continue; fi
+        echo ""
+        ok "Task received"
+        echo ""
+        echo -e "  ${WHITE}\"${NC}${BOLD}$TASK${NC}${WHITE}\"${NC}"
+        echo ""
+        ts "Mode: ${BOLD}full pipeline${NC} (4 phases)"
+        echo ""
         history_add "full" "$TASK"
         return 0
         ;;
@@ -289,6 +309,13 @@ run_interactive() {
         echo -ne "  ${BOLD}Describe the task:${NC}\n\n  ${BRIGHT_CYAN}>${NC} "
         read -r TASK
         if [[ -z "$TASK" ]]; then warn "No task entered."; echo ""; continue; fi
+        echo ""
+        ok "Task received"
+        echo ""
+        echo -e "  ${WHITE}\"${NC}${BOLD}$TASK${NC}${WHITE}\"${NC}"
+        echo ""
+        ts "Mode: ${BOLD}plan only${NC} (2 phases, no code changes)"
+        echo ""
         PLAN_ONLY=true
         history_add "plan-only" "$TASK"
         return 0
@@ -303,6 +330,9 @@ run_interactive() {
         if [[ -f "$HARNESS_DIR/task.txt" ]]; then
           TASK=$(cat "$HARNESS_DIR/task.txt")
         fi
+        echo ""
+        ts "Resuming from existing plan — launching Builder..."
+        echo ""
         history_add "build" "$TASK"
         return 0
         ;;
@@ -316,6 +346,9 @@ run_interactive() {
         if [[ -f "$HARNESS_DIR/task.txt" ]]; then
           TASK=$(cat "$HARNESS_DIR/task.txt")
         fi
+        echo ""
+        ts "Launching QA review..."
+        echo ""
         history_add "qa" "$TASK"
         return 0
         ;;
@@ -463,18 +496,18 @@ run_phase() {
 
   phase "$phase_label"
   log "Starting phase: $name [$phase_idx/$total_phases]"
+  ts "Connecting to Claude..."
 
   local start_time=$SECONDS
 
   if $QUIET; then
     # Silent mode: output only to file (original behavior)
-    info "Running $name agent ${DIM}(quiet mode)${NC}..."
     if claude -p \
       --dangerously-skip-permissions \
       "$prompt" \
       > "$output_file" 2>>"$LOG_FILE"; then
       local elapsed=$(( SECONDS - start_time ))
-      ok "$name completed in ${elapsed}s — output: $output_file"
+      ts "${BRIGHT_GREEN}✓${NC} $name completed in ${elapsed}s — output: $output_file"
       log "$name completed in ${elapsed}s"
     else
       local elapsed=$(( SECONDS - start_time ))
@@ -493,12 +526,12 @@ run_phase() {
         "$output_file" "$name" "$SESSION_FILE"; then
       local elapsed=$(( SECONDS - start_time ))
       echo ""
-      ok "$name completed in ${elapsed}s — saved: ${DIM}$output_file${NC}"
+      ts "${BRIGHT_GREEN}✓${NC} $name completed in ${elapsed}s — saved: ${DIM}$output_file${NC}"
       log "$name completed in ${elapsed}s"
     else
       local elapsed=$(( SECONDS - start_time ))
       echo ""
-      err "$name failed after ${elapsed}s. Check $LOG_FILE for details."
+      ts "${BRIGHT_RED}✗${NC} $name failed after ${elapsed}s. Check $LOG_FILE for details."
       log "$name FAILED after ${elapsed}s"
       exit 1
     fi
@@ -828,6 +861,27 @@ with open(sys.argv[4], 'w') as f:
 
 RUN_START=$SECONDS
 
+# --- Check if structurer can be skipped ---------------------------------------
+SKIP_STRUCTURER=false
+STRUCTURE_AGE_MIN=""
+
+if [[ -f "$HARNESS_DIR/structure.md" ]] && ! $FRESH; then
+  # Get age in minutes
+  STRUCTURE_AGE_MIN=$(( ( $(date +%s) - $(stat -c %Y "$HARNESS_DIR/structure.md") ) / 60 ))
+  if [[ "$STRUCTURE_AGE_MIN" -lt 60 ]]; then
+    SKIP_STRUCTURER=true
+  fi
+fi
+
+# Adjust phase counts if skipping structurer
+if $SKIP_STRUCTURER; then
+  if $PLAN_ONLY; then
+    TOTAL_PHASES=1  # just planner
+  elif ! $QA_ONLY && ! $BUILDER_ONLY && ! $SKIP_PLAN; then
+    TOTAL_PHASES=3  # planner + builder + qa
+  fi
+fi
+
 # --- Execute pipeline ---------------------------------------------------------
 if $QA_ONLY; then
   CURRENT_PHASE=1; run_qa
@@ -837,13 +891,27 @@ elif $SKIP_PLAN; then
   CURRENT_PHASE=1; run_builder
   CURRENT_PHASE=2; run_qa
 elif $PLAN_ONLY; then
-  CURRENT_PHASE=1; run_structurer
-  CURRENT_PHASE=2; run_planner
+  if $SKIP_STRUCTURER; then
+    ts "Reusing existing structure.md ${DIM}(${STRUCTURE_AGE_MIN} min old)${NC}"
+    echo ""
+    CURRENT_PHASE=1; run_planner
+  else
+    CURRENT_PHASE=1; run_structurer
+    CURRENT_PHASE=2; run_planner
+  fi
 else
-  CURRENT_PHASE=1; run_structurer
-  CURRENT_PHASE=2; run_planner
-  CURRENT_PHASE=3; run_builder
-  CURRENT_PHASE=4; run_qa
+  if $SKIP_STRUCTURER; then
+    ts "Reusing existing structure.md ${DIM}(${STRUCTURE_AGE_MIN} min old)${NC}"
+    echo ""
+    CURRENT_PHASE=1; run_planner
+    CURRENT_PHASE=2; run_builder
+    CURRENT_PHASE=3; run_qa
+  else
+    CURRENT_PHASE=1; run_structurer
+    CURRENT_PHASE=2; run_planner
+    CURRENT_PHASE=3; run_builder
+    CURRENT_PHASE=4; run_qa
+  fi
 fi
 
 # --- Finalize session ---------------------------------------------------------
