@@ -2,7 +2,7 @@
 """
 Stream processor for dev-harness.
 Reads claude --output-format stream-json from stdin, displays live tool
-calls and text with a spinner + live token counter, writes the final
+calls and text with a spinner + live token/cost counter, writes the final
 result to an artifact file, and appends phase cost/duration to the
 session ledger.
 """
@@ -10,8 +10,17 @@ session ledger.
 import sys
 import json
 import os
+import shutil
 import threading
 import time
+
+
+def get_term_width(default=80):
+    """Return current terminal width, falling back to *default*."""
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
 
 # ANSI colors
 CYAN = "\033[0;36m"
@@ -46,12 +55,49 @@ TOOL_DISPLAY = {
     "Agent": ("Agent", "prompt"),
 }
 
+# Approximate pricing per million tokens (USD)
+# Used for live cost estimation in the spinner
+MODEL_PRICING = {
+    "opus": {"input": 15.0, "output": 75.0, "cache_read": 1.50},
+    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30},
+    "haiku": {"input": 0.80, "output": 4.0, "cache_read": 0.08},
+    "default": {"input": 15.0, "output": 75.0, "cache_read": 1.50},
+}
+
+
+def get_pricing(model_name):
+    """Get pricing dict for a model name (fuzzy match)."""
+    model_lower = (model_name or "").lower()
+    for key in MODEL_PRICING:
+        if key in model_lower:
+            return MODEL_PRICING[key]
+    return MODEL_PRICING["default"]
+
+
+def estimate_cost(pricing, input_tokens, output_tokens, cache_read_tokens=0):
+    """Estimate cost in USD from token counts."""
+    cost = (
+        (input_tokens / 1_000_000) * pricing["input"]
+        + (output_tokens / 1_000_000) * pricing["output"]
+        + (cache_read_tokens / 1_000_000) * pricing["cache_read"]
+    )
+    return cost
+
 
 def fmt_tokens(n):
     """Format token count with K suffix."""
     if n >= 1000:
         return f"{n / 1000:.1f}K"
     return str(n)
+
+
+def fmt_cost(cost):
+    """Format cost as $X.XX or $X.XXXX for small amounts."""
+    if cost >= 0.01:
+        return f"${cost:.2f}"
+    elif cost > 0:
+        return f"${cost:.4f}"
+    return ""
 
 
 def format_tool_detail(name, inp):
@@ -85,14 +131,16 @@ def format_tool_detail(name, inp):
 
 
 class StatusLine:
-    """Manages the spinner and live token counter on a single line."""
+    """Manages the spinner and live token/cost counter on a single line."""
 
-    def __init__(self):
+    def __init__(self, pricing):
         self.active = False
         self.label = "Thinking"
         self.tokens_in = 0
         self.tokens_out = 0
+        self.cache_read = 0
         self.start_time = time.time()
+        self.pricing = pricing
         self._frame = 0
         self._thread = None
         self._stop = threading.Event()
@@ -116,11 +164,18 @@ class StatusLine:
                 tok_str = ""
                 total = self.tokens_in + self.tokens_out
                 if total > 0:
+                    cost = estimate_cost(
+                        self.pricing, self.tokens_in, self.tokens_out, self.cache_read
+                    )
+                    cost_str = fmt_cost(cost)
+                    cost_part = f"  {cost_str}" if cost_str else ""
+
                     tok_str = (
                         f" {DIM}│{NC} "
                         f"{fmt_tokens(total)} tok "
                         f"{DIM}(in:{fmt_tokens(self.tokens_in)} "
                         f"out:{fmt_tokens(self.tokens_out)}){NC}"
+                        f"{cost_part}"
                     )
 
                 line = (
@@ -135,7 +190,7 @@ class StatusLine:
 
             self._stop.wait(0.1)
 
-    def update(self, label=None, tokens_in=None, tokens_out=None):
+    def update(self, label=None, tokens_in=None, tokens_out=None, cache_read=None):
         with self._lock:
             if label is not None:
                 self.label = label
@@ -143,6 +198,8 @@ class StatusLine:
                 self.tokens_in = tokens_in
             if tokens_out is not None:
                 self.tokens_out = tokens_out
+            if cache_read is not None:
+                self.cache_read = cache_read
 
     def clear(self):
         """Clear the status line so other output can print cleanly."""
@@ -163,6 +220,9 @@ def main():
     output_file = sys.argv[1] if len(sys.argv) > 1 else None
     phase_name = sys.argv[2] if len(sys.argv) > 2 else "unknown"
     session_file = sys.argv[3] if len(sys.argv) > 3 else None
+    model_name = sys.argv[4] if len(sys.argv) > 4 else "default"
+
+    pricing = get_pricing(model_name)
 
     final_text = ""
     duration_ms = 0
@@ -174,8 +234,9 @@ def main():
     # Running token accumulator (updated from usage events)
     running_input = 0
     running_output = 0
+    running_cache_read = 0
 
-    status = StatusLine()
+    status = StatusLine(pricing)
     status.start()
 
     try:
@@ -196,9 +257,13 @@ def main():
                 u = event["usage"]
                 running_input = u.get("input_tokens", running_input)
                 running_output = u.get("output_tokens", running_output)
+                running_cache_read = u.get(
+                    "cache_read_input_tokens", running_cache_read
+                )
                 status.update(
-                    tokens_in=running_input + u.get("cache_read_input_tokens", 0),
+                    tokens_in=running_input + running_cache_read,
                     tokens_out=running_output,
+                    cache_read=running_cache_read,
                 )
 
             if etype == "assistant":
@@ -209,9 +274,13 @@ def main():
                 if msg_usage:
                     running_input = msg_usage.get("input_tokens", running_input)
                     running_output = msg_usage.get("output_tokens", running_output)
+                    running_cache_read = msg_usage.get(
+                        "cache_read_input_tokens", running_cache_read
+                    )
                     status.update(
-                        tokens_in=running_input + msg_usage.get("cache_read_input_tokens", 0),
+                        tokens_in=running_input + running_cache_read,
                         tokens_out=running_output,
+                        cache_read=running_cache_read,
                     )
 
                 for block in content:
@@ -241,8 +310,9 @@ def main():
                         if text:
                             if not text_started and tool_count > 0:
                                 status.clear()
+                                sep_w = max(get_term_width() - 4, 20)
                                 print(
-                                    f"\n  {DIM}{'─' * 50}{NC}\n",
+                                    f"\n  {DIM}{'─' * sep_w}{NC}\n",
                                     flush=True,
                                 )
                             status.stop()
