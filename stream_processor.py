@@ -2,15 +2,16 @@
 """
 Stream processor for dev-harness.
 Reads claude --output-format stream-json from stdin, displays live tool
-calls and text with a spinner + live token/cost counter, writes the final
-result to an artifact file, and appends phase cost/duration to the
-session ledger.
+calls (with full inputs and outputs), Claude's reasoning text, and a
+spinner + live token/cost counter. Writes the final result to an artifact
+file and appends phase cost/duration to the session ledger.
 """
 
 import sys
 import json
 import os
 import shutil
+import textwrap
 import threading
 import time
 
@@ -22,6 +23,7 @@ def get_term_width(default=80):
     except Exception:
         return default
 
+
 # ANSI colors
 CYAN = "\033[0;36m"
 BRIGHT_CYAN = "\033[1;36m"
@@ -31,6 +33,7 @@ GREEN = "\033[0;32m"
 BRIGHT_GREEN = "\033[1;32m"
 YELLOW = "\033[1;33m"
 RED = "\033[0;31m"
+MAGENTA = "\033[0;35m"
 NC = "\033[0m"
 
 # Cursor control
@@ -39,7 +42,7 @@ SHOW_CURSOR = "\033[?25h"
 CLEAR_LINE = "\033[2K\r"
 
 # Spinner frames
-SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+SPINNER = ["\u28cb", "\u28d9", "\u28f9", "\u28f8", "\u28fc", "\u28f4", "\u28e6", "\u28e7", "\u28c7", "\u28cf"]
 
 # Tool display names and primary input key
 TOOL_DISPLAY = {
@@ -56,13 +59,15 @@ TOOL_DISPLAY = {
 }
 
 # Approximate pricing per million tokens (USD)
-# Used for live cost estimation in the spinner
 MODEL_PRICING = {
     "opus": {"input": 15.0, "output": 75.0, "cache_read": 1.50},
     "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30},
     "haiku": {"input": 0.80, "output": 4.0, "cache_read": 0.08},
     "default": {"input": 15.0, "output": 75.0, "cache_read": 1.50},
 }
+
+# Max lines to show for tool results before truncating
+TOOL_RESULT_MAX_LINES = 25
 
 
 def get_pricing(model_name):
@@ -100,34 +105,147 @@ def fmt_cost(cost):
     return ""
 
 
-def format_tool_detail(name, inp):
-    """Extract a short, readable detail string from tool input."""
-    if name in TOOL_DISPLAY:
-        _, key = TOOL_DISPLAY[name]
-        val = inp.get(key, "")
-    else:
-        val = inp.get("file_path", inp.get("command", inp.get("pattern", "")))
+def indent_block(text, prefix="    "):
+    """Indent every line of text with a prefix."""
+    lines = text.split("\n")
+    return "\n".join(prefix + line for line in lines)
 
-    if not val:
-        return ""
 
-    val = str(val)
+def truncate_lines(text, max_lines):
+    """Truncate text to max_lines, adding a note if truncated."""
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return text
+    kept = lines[:max_lines]
+    omitted = len(lines) - max_lines
+    kept.append(f"  ... ({omitted} more lines)")
+    return "\n".join(kept)
 
-    # For file paths, show just the filename + parent
-    if "/" in val and name in ("Read", "Edit", "Write", "NotebookEdit"):
-        parts = val.rstrip("/").split("/")
-        val = "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
 
-    # For bash commands, show first 55 chars
+def format_tool_input_full(name, inp):
+    """Format the full tool input for display."""
+    display_name = TOOL_DISPLAY.get(name, (name, ""))[0]
+    parts = []
+
     if name == "Bash":
-        val = val.split("\n")[0]
-        if len(val) > 55:
-            val = val[:52] + "..."
+        cmd = inp.get("command", "")
+        desc = inp.get("description", "")
+        if desc:
+            parts.append(f"  {BRIGHT_CYAN}> {CYAN}{display_name}{NC}  {DIM}{desc}{NC}")
+        else:
+            parts.append(f"  {BRIGHT_CYAN}> {CYAN}{display_name}{NC}")
+        if cmd:
+            parts.append(f"  {DIM}${NC} {cmd}")
 
-    if len(val) > 60:
-        val = val[:57] + "..."
+    elif name in ("Read", "Write"):
+        fpath = inp.get("file_path", "")
+        parts.append(f"  {BRIGHT_CYAN}> {CYAN}{display_name}{NC}  {fpath}")
+        if name == "Read":
+            offset = inp.get("offset")
+            limit = inp.get("limit")
+            if offset or limit:
+                extra = []
+                if offset:
+                    extra.append(f"offset={offset}")
+                if limit:
+                    extra.append(f"limit={limit}")
+                parts.append(f"    {DIM}{', '.join(extra)}{NC}")
 
-    return val
+    elif name == "Edit":
+        fpath = inp.get("file_path", "")
+        old = inp.get("old_string", "")
+        new = inp.get("new_string", "")
+        parts.append(f"  {BRIGHT_CYAN}> {CYAN}{display_name}{NC}  {fpath}")
+        if old:
+            old_preview = old.strip().split("\n")
+            if len(old_preview) > 5:
+                old_preview = old_preview[:5] + ["..."]
+            parts.append(f"    {RED}- {DIM}" + f"\n    {RED}- {DIM}".join(old_preview) + NC)
+        if new:
+            new_preview = new.strip().split("\n")
+            if len(new_preview) > 5:
+                new_preview = new_preview[:5] + ["..."]
+            parts.append(f"    {GREEN}+ {DIM}" + f"\n    {GREEN}+ {DIM}".join(new_preview) + NC)
+
+    elif name in ("Grep", "Glob"):
+        pattern = inp.get("pattern", "")
+        path = inp.get("path", "")
+        parts.append(f"  {BRIGHT_CYAN}> {CYAN}{display_name}{NC}  {YELLOW}{pattern}{NC}")
+        if path:
+            parts.append(f"    {DIM}in {path}{NC}")
+        extras = []
+        if name == "Grep":
+            if inp.get("glob"):
+                extras.append(f"glob={inp['glob']}")
+            if inp.get("type"):
+                extras.append(f"type={inp['type']}")
+            if inp.get("output_mode"):
+                extras.append(f"mode={inp['output_mode']}")
+        if extras:
+            parts.append(f"    {DIM}{', '.join(extras)}{NC}")
+
+    elif name == "Agent":
+        prompt = inp.get("prompt", "")
+        desc = inp.get("description", "")
+        parts.append(f"  {BRIGHT_CYAN}> {CYAN}{display_name}{NC}  {DIM}{desc}{NC}")
+        if prompt:
+            preview = prompt.strip()[:200]
+            if len(prompt.strip()) > 200:
+                preview += "..."
+            parts.append(f"    {DIM}{preview}{NC}")
+
+    elif name in ("WebSearch", "WebFetch"):
+        query_or_url = inp.get("query", inp.get("url", ""))
+        parts.append(f"  {BRIGHT_CYAN}> {CYAN}{display_name}{NC}  {query_or_url}")
+
+    else:
+        # Generic fallback
+        parts.append(f"  {BRIGHT_CYAN}> {CYAN}{name}{NC}")
+        for k, v in inp.items():
+            val_str = str(v)
+            if len(val_str) > 120:
+                val_str = val_str[:117] + "..."
+            parts.append(f"    {DIM}{k}: {val_str}{NC}")
+
+    return "\n".join(parts)
+
+
+def format_tool_result(event):
+    """Format tool result output from a 'user' type event."""
+    content_list = event.get("message", {}).get("content", [])
+    # Also check tool_use_result for richer data
+    tool_result = event.get("tool_use_result", {})
+
+    parts = []
+
+    for item in content_list:
+        if item.get("type") == "tool_result":
+            result_text = item.get("content", "")
+            if isinstance(result_text, list):
+                # Content can be a list of blocks
+                for block in result_text:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        result_text = block.get("text", "")
+                        break
+                else:
+                    result_text = str(result_text)
+            if result_text:
+                result_text = str(result_text).strip()
+                result_text = truncate_lines(result_text, TOOL_RESULT_MAX_LINES)
+                parts.append(f"    {DIM}{result_text}{NC}")
+
+    # If tool_use_result has file content, show it
+    if not parts and tool_result:
+        tr_type = tool_result.get("type", "")
+        if tr_type == "text":
+            file_info = tool_result.get("file", {})
+            if file_info:
+                content = file_info.get("content", "")
+                if content:
+                    content = truncate_lines(content.strip(), TOOL_RESULT_MAX_LINES)
+                    parts.append(f"    {DIM}{content}{NC}")
+
+    return "\n".join(parts) if parts else ""
 
 
 class StatusLine:
@@ -147,6 +265,8 @@ class StatusLine:
         self._lock = threading.Lock()
 
     def start(self):
+        if self.active:
+            return
         self.active = True
         self._stop.clear()
         sys.stdout.write(HIDE_CURSOR)
@@ -171,7 +291,7 @@ class StatusLine:
                     cost_part = f"  {cost_str}" if cost_str else ""
 
                     tok_str = (
-                        f" {DIM}│{NC} "
+                        f" {DIM}\u2502{NC} "
                         f"{fmt_tokens(total)} tok "
                         f"{DIM}(in:{fmt_tokens(self.tokens_in)} "
                         f"out:{fmt_tokens(self.tokens_out)}){NC}"
@@ -182,7 +302,7 @@ class StatusLine:
                     f"{CLEAR_LINE}"
                     f"  {BRIGHT_CYAN}{frame}{NC} "
                     f"{DIM}{self.label}{NC}"
-                    f" {DIM}│{NC} {DIM}{elapsed:.0f}s{NC}"
+                    f" {DIM}\u2502{NC} {DIM}{elapsed:.0f}s{NC}"
                     f"{tok_str}"
                 )
                 sys.stdout.write(line)
@@ -230,6 +350,7 @@ def main():
     usage = {}
     tool_count = 0
     text_started = False
+    last_was_tool = False  # Track if the last thing printed was a tool call
 
     # Running token accumulator (updated from usage events)
     running_input = 0
@@ -289,7 +410,6 @@ def main():
                     if btype == "tool_use":
                         name = block.get("name", "?")
                         inp = block.get("input", {})
-                        detail = format_tool_detail(name, inp)
                         display_name = TOOL_DISPLAY.get(name, (name, ""))[0]
 
                         if text_started:
@@ -297,28 +417,47 @@ def main():
                             text_started = False
 
                         status.clear()
-                        print(
-                            f"  {BRIGHT_CYAN}> {CYAN}{display_name:<9}{NC}"
-                            f" {DIM}{detail}{NC}",
-                            flush=True,
-                        )
+                        # Print full tool input
+                        tool_display = format_tool_input_full(name, inp)
+                        print(tool_display, flush=True)
                         tool_count += 1
-                        status.update(label=f"{display_name} {detail[:30]}")
+                        last_was_tool = True
+
+                        # Update spinner label with short summary
+                        short = TOOL_DISPLAY.get(name, (name, ""))[1]
+                        short_val = str(inp.get(short, ""))[:40] if short else ""
+                        status.update(label=f"{display_name} {short_val}")
 
                     elif btype == "text":
                         text = block.get("text", "")
                         if text:
-                            if not text_started and tool_count > 0:
-                                status.clear()
+                            status.clear()
+                            if not text_started:
+                                # Print a separator + "Claude:" header
                                 sep_w = max(get_term_width() - 4, 20)
                                 print(
-                                    f"\n  {DIM}{'─' * sep_w}{NC}\n",
+                                    f"\n  {MAGENTA}{BOLD}Claude:{NC}",
                                     flush=True,
                                 )
                             status.stop()
                             text_started = True
-                            sys.stdout.write(text)
+                            last_was_tool = False
+                            # Indent Claude's reasoning for visual clarity
+                            for tline in text.split("\n"):
+                                sys.stdout.write(f"  {tline}\n")
                             sys.stdout.flush()
+
+            elif etype == "user":
+                # This is a tool result — show the output
+                result_display = format_tool_result(event)
+                if result_display:
+                    status.clear()
+                    print(result_display, flush=True)
+
+                # Restart spinner after tool result
+                if not status.active:
+                    status.start()
+                status.update(label="Thinking")
 
             elif etype == "result":
                 final_text = event.get("result", "")
