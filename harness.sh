@@ -7,28 +7,36 @@ set -euo pipefail
 # Communication via markdown artifacts in .harness/
 # =============================================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS_DIR=".harness"
+SESSIONS_DIR="$HARNESS_DIR/sessions"
 HISTORY_FILE="$HARNESS_DIR/history.log"
 LOG_FILE="$HARNESS_DIR/run.log"
+SESSION_FILE=""
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+TOTAL_COST=0
 
 # --- Colors & output helpers -------------------------------------------------
 RED='\033[0;31m'
+BRIGHT_RED='\033[1;31m'
 GREEN='\033[0;32m'
+BRIGHT_GREEN='\033[1;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BRIGHT_CYAN='\033[1;36m'
 MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
 DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-info()  { echo -e "${BLUE}[info]${NC}  $*"; }
-ok()    { echo -e "${GREEN}  ✓${NC}  $*"; }
-warn()  { echo -e "${YELLOW}  !${NC}  $*"; }
-err()   { echo -e "${RED}  ✗${NC}  $*" >&2; }
-phase() { echo -e "\n${BOLD}${CYAN}════════ $* ════════${NC}\n"; }
-dim()   { echo -e "${DIM}$*${NC}"; }
+info()  { echo -e "  ${BLUE}ℹ${NC}  $*"; }
+ok()    { echo -e "  ${BRIGHT_GREEN}✓${NC}  $*"; }
+warn()  { echo -e "  ${YELLOW}!${NC}  $*"; }
+err()   { echo -e "  ${BRIGHT_RED}✗${NC}  $*" >&2; }
+phase() { echo -e "\n  ${WHITE}════${NC} ${BOLD}${BRIGHT_CYAN}$*${NC} ${WHITE}════${NC}\n"; }
+dim()   { echo -e "  ${DIM}$*${NC}"; }
 
 log() {
   local msg="[$(date +"%H:%M:%S")] $*"
@@ -93,9 +101,14 @@ if $CLEAN; then
   exit 0
 fi
 
-# --- Validate claude CLI ----------------------------------------------------
+# --- Validate dependencies ---------------------------------------------------
 if ! command -v claude &>/dev/null; then
   err "Claude Code CLI not found. Install it first: https://docs.anthropic.com/en/docs/claude-code"
+  exit 1
+fi
+
+if ! command -v python3 &>/dev/null; then
+  err "python3 is required for live streaming. Install it first."
   exit 1
 fi
 
@@ -105,19 +118,76 @@ history_add() {
   echo "$(date +"%Y-%m-%d %H:%M") | $1 | $2" >> "$HISTORY_FILE"
 }
 
-history_show() {
-  if [[ -f "$HISTORY_FILE" ]]; then
+# --- Session stats -----------------------------------------------------------
+get_session_stats() {
+  # Returns "count total_cost" from session files
+  python3 -c "
+import json, glob, os
+sessions_dir = '$SESSIONS_DIR'
+total_cost = 0.0
+count = 0
+for f in sorted(glob.glob(os.path.join(sessions_dir, '*.json'))):
+    try:
+        with open(f) as fh:
+            s = json.load(fh)
+        total_cost += s.get('total_cost_usd', 0)
+        count += 1
+    except: pass
+print(f'{count} {total_cost:.2f}')
+" 2>/dev/null || echo "0 0.00"
+}
+
+sessions_show() {
+  if [[ ! -d "$SESSIONS_DIR" ]] || [[ -z "$(ls -A "$SESSIONS_DIR" 2>/dev/null)" ]]; then
+    dim "  No sessions yet."
     echo ""
-    echo -e "  ${BOLD}Recent tasks${NC}"
-    echo -e "  ${DIM}─────────────────────────────────────────────────${NC}"
-    tail -10 "$HISTORY_FILE" | nl -ba -w2 -s'  ' | while IFS= read -r line; do
-      echo -e "  ${DIM}$line${NC}"
-    done
-    echo ""
-  else
-    dim "  No task history yet."
-    echo ""
+    return
   fi
+
+  echo ""
+  echo -e "  ${BOLD}Recent sessions${NC}"
+  echo -e "  ${DIM}────────────────────────────────────────────────────────────────${NC}"
+
+  python3 -c "
+import json, glob, os
+sessions_dir = '$SESSIONS_DIR'
+files = sorted(glob.glob(os.path.join(sessions_dir, '*.json')))[-10:]
+for i, f in enumerate(files, 1):
+    try:
+        with open(f) as fh:
+            s = json.load(fh)
+        task = s.get('task', '?')[:35]
+        mode = s.get('mode', '?')
+        dur = s.get('total_duration_s', 0)
+        cost = s.get('total_cost_usd', 0)
+        verdict = s.get('qa_verdict', '--')
+        started = s.get('started', '?')
+
+        # Format duration
+        if dur >= 60:
+            dur_str = f'{dur // 60}m{dur % 60:02.0f}s'
+        else:
+            dur_str = f'{dur:.0f}s'
+
+        # Format date (from YYYY-MM-DD_HH-MM-SS)
+        parts = started.split('_')
+        date_part = parts[0][5:] if len(parts) > 0 else '?'  # MM-DD
+        time_part = parts[1][:5].replace('-', ':') if len(parts) > 1 else '?'
+
+        # Color verdict
+        v_color = ''
+        if verdict == 'PASS':
+            v_color = '\033[1;32m'
+        elif verdict == 'FAIL':
+            v_color = '\033[1;31m'
+        else:
+            v_color = '\033[2m'
+
+        print(f'  \033[2m{i:>2}\033[0m  {date_part} {time_part}  \033[1m{mode:<11}\033[0m {dur_str:>6}  \033[2m\${cost:.2f}\033[0m  {v_color}{verdict:<4}\033[0m  \033[2m{task}\033[0m')
+    except: pass
+" 2>/dev/null
+
+  echo ""
 }
 
 # --- Artifact status ---------------------------------------------------------
@@ -129,7 +199,7 @@ artifact_status() {
     size=$(wc -c < "$file" | tr -d ' ')
     local modified
     modified=$(date -r "$file" +"%H:%M" 2>/dev/null || stat -c '%y' "$file" 2>/dev/null | cut -d. -f1)
-    echo -e "    ${GREEN}●${NC} $label ${DIM}(${size}B, $modified)${NC}"
+    echo -e "    ${BRIGHT_GREEN}●${NC} ${BOLD}$label${NC} ${DIM}(${size}B, $modified)${NC}"
   else
     echo -e "    ${DIM}○ $label${NC}"
   fi
@@ -151,10 +221,20 @@ show_status() {
 
 # --- Banner ------------------------------------------------------------------
 show_banner() {
+  local stats
+  stats=$(get_session_stats)
+  local count=${stats%% *}
+  local total_cost=${stats##* }
+
   echo ""
-  echo -e "  ${BOLD}${CYAN}┌─────────────────────────────────────┐${NC}"
-  echo -e "  ${BOLD}${CYAN}│${NC}   ${BOLD}dev-harness${NC}  ${DIM}multi-agent pipeline${NC}  ${BOLD}${CYAN}│${NC}"
-  echo -e "  ${BOLD}${CYAN}└─────────────────────────────────────┘${NC}"
+  echo -e "  ${WHITE}┌─────────────────────────────────────────────────┐${NC}"
+  echo -e "  ${WHITE}│${NC}                                                 ${WHITE}│${NC}"
+  echo -e "  ${WHITE}│${NC}   ${BOLD}${BRIGHT_CYAN}dev-harness${NC}  ${DIM}multi-agent pipeline${NC}          ${WHITE}│${NC}"
+  if [[ "$count" -gt 0 ]]; then
+    echo -e "  ${WHITE}│${NC}   ${DIM}${count} sessions${NC} ${DIM}|${NC} ${DIM}\$${total_cost} total${NC}                   ${WHITE}│${NC}"
+  fi
+  echo -e "  ${WHITE}│${NC}                                                 ${WHITE}│${NC}"
+  echo -e "  ${WHITE}└─────────────────────────────────────────────────┘${NC}"
   echo -e "  ${DIM}$(basename "$(pwd)")${NC}"
 }
 
@@ -163,33 +243,50 @@ run_interactive() {
   show_banner
   show_status
 
+  # Check what's available for smart menu
+  local has_plan=false
+  local has_build=false
+  [[ -f "$HARNESS_DIR/plan.md" ]] && has_plan=true
+  [[ -f "$HARNESS_DIR/build-result.md" ]] && has_build=true
+
   while true; do
     echo -e "  ${BOLD}What do you want to do?${NC}"
     echo ""
-    echo -e "    ${BOLD}1${NC}  New task            ${DIM}full pipeline${NC}"
-    echo -e "    ${BOLD}2${NC}  Plan only           ${DIM}structure + plan, no code changes${NC}"
-    echo -e "    ${BOLD}3${NC}  Build from plan     ${DIM}execute existing plan${NC}"
-    echo -e "    ${BOLD}4${NC}  QA only             ${DIM}review current changes${NC}"
-    echo -e "    ${BOLD}5${NC}  View artifact        ${DIM}read an output file${NC}"
-    echo -e "    ${BOLD}6${NC}  History             ${DIM}past tasks${NC}"
-    echo -e "    ${BOLD}7${NC}  Clean               ${DIM}wipe .harness/${NC}"
-    echo -e "    ${BOLD}q${NC}  Quit"
+    echo -e "    ${BRIGHT_CYAN}1${NC}  ${BOLD}New task${NC}            ${DIM}full pipeline${NC}"
+    echo -e "    ${BRIGHT_CYAN}2${NC}  ${BOLD}Plan only${NC}           ${DIM}structure + plan, no code changes${NC}"
+
+    if $has_plan; then
+      echo -e "    ${BRIGHT_CYAN}3${NC}  ${BOLD}Build from plan${NC}     ${DIM}execute existing plan${NC}"
+    else
+      echo -e "    ${DIM}    3  Build from plan     (no plan yet)${NC}"
+    fi
+
+    if $has_build; then
+      echo -e "    ${BRIGHT_CYAN}4${NC}  ${BOLD}QA only${NC}             ${DIM}review current changes${NC}"
+    else
+      echo -e "    ${DIM}    4  QA only             (no build yet)${NC}"
+    fi
+
+    echo -e "    ${BRIGHT_CYAN}5${NC}  ${BOLD}View artifact${NC}       ${DIM}read an output file${NC}"
+    echo -e "    ${BRIGHT_CYAN}6${NC}  ${BOLD}Sessions${NC}            ${DIM}past runs with cost & status${NC}"
+    echo -e "    ${BRIGHT_CYAN}7${NC}  ${BOLD}Clean${NC}               ${DIM}wipe .harness/${NC}"
+    echo -e "    ${DIM}q  Quit${NC}"
     echo ""
-    echo -ne "  ${CYAN}>${NC} "
+    echo -ne "  ${BRIGHT_CYAN}>${NC} "
     read -r choice
 
     case "$choice" in
       1)
         echo ""
-        echo -ne "  ${BOLD}Describe the task:${NC} "
+        echo -ne "  ${BOLD}Describe the task:${NC}\n\n  ${BRIGHT_CYAN}>${NC} "
         read -r TASK
         if [[ -z "$TASK" ]]; then warn "No task entered."; echo ""; continue; fi
         history_add "full" "$TASK"
-        return 0  # proceed to full pipeline
+        return 0
         ;;
       2)
         echo ""
-        echo -ne "  ${BOLD}Describe the task:${NC} "
+        echo -ne "  ${BOLD}Describe the task:${NC}\n\n  ${BRIGHT_CYAN}>${NC} "
         read -r TASK
         if [[ -z "$TASK" ]]; then warn "No task entered."; echo ""; continue; fi
         PLAN_ONLY=true
@@ -197,8 +294,8 @@ run_interactive() {
         return 0
         ;;
       3)
-        if [[ ! -f "$HARNESS_DIR/plan.md" ]]; then
-          warn "No plan found. Run a plan first."
+        if ! $has_plan; then
+          warn "No plan found. Run option 2 first."
           echo ""
           continue
         fi
@@ -210,6 +307,11 @@ run_interactive() {
         return 0
         ;;
       4)
+        if ! $has_build; then
+          warn "No build found. Run a build first."
+          echo ""
+          continue
+        fi
         QA_ONLY=true
         if [[ -f "$HARNESS_DIR/task.txt" ]]; then
           TASK=$(cat "$HARNESS_DIR/task.txt")
@@ -219,13 +321,19 @@ run_interactive() {
         ;;
       5)
         echo ""
-        echo -e "    ${BOLD}a${NC}  structure.md"
-        echo -e "    ${BOLD}b${NC}  plan.md"
-        echo -e "    ${BOLD}c${NC}  build-result.md"
-        echo -e "    ${BOLD}d${NC}  qa-report.md"
-        echo -e "    ${BOLD}e${NC}  run.log"
+        for pair in "a:structure.md" "b:plan.md" "c:build-result.md" "d:qa-report.md" "e:run.log"; do
+          local key="${pair%%:*}"
+          local fname="${pair##*:}"
+          local fpath="$HARNESS_DIR/$fname"
+          [[ "$fname" == "run.log" ]] && fpath="$LOG_FILE"
+          if [[ -f "$fpath" ]]; then
+            echo -e "    ${BRIGHT_CYAN}${key}${NC}  ${BOLD}$fname${NC}"
+          else
+            echo -e "    ${DIM}${key}  $fname  (empty)${NC}"
+          fi
+        done
         echo ""
-        echo -ne "  ${CYAN}>${NC} "
+        echo -ne "  ${BRIGHT_CYAN}>${NC} "
         read -r artifact_choice
         local artifact_file=""
         case "$artifact_choice" in
@@ -238,23 +346,22 @@ run_interactive() {
         esac
         if [[ -f "$artifact_file" ]]; then
           echo ""
-          echo -e "  ${DIM}─── $artifact_file ───${NC}"
+          echo -e "  ${WHITE}─── ${BOLD}$artifact_file${NC} ${WHITE}───${NC}"
           echo ""
-          # use less if available and output is large, otherwise cat
           if [[ $(wc -l < "$artifact_file") -gt 40 ]] && command -v less &>/dev/null; then
             less -R "$artifact_file"
           else
             cat "$artifact_file"
           fi
           echo ""
-          echo -e "  ${DIM}─── end ───${NC}"
+          echo -e "  ${WHITE}─── end ───${NC}"
         else
           warn "File not found: $artifact_file"
         fi
         echo ""
         ;;
       6)
-        history_show
+        sessions_show
         ;;
       7)
         if [[ -d "$HARNESS_DIR" ]]; then
@@ -268,7 +375,7 @@ run_interactive() {
         ;;
       q|Q|quit|exit)
         echo ""
-        dim "  bye."
+        dim "bye."
         echo ""
         exit 0
         ;;
@@ -346,15 +453,22 @@ run_phase() {
   local name="$1"
   local prompt="$2"
   local output_file="$3"
+  local phase_idx="${4:-0}"
+  local total_phases="${5:-0}"
 
-  phase "$name"
-  log "Starting phase: $name"
-  info "Running $name agent..."
+  local phase_label="$name"
+  if [[ "$total_phases" -gt 0 ]]; then
+    phase_label="$name ${DIM}[$phase_idx/$total_phases]${NC}"
+  fi
+
+  phase "$phase_label"
+  log "Starting phase: $name [$phase_idx/$total_phases]"
 
   local start_time=$SECONDS
 
   if $QUIET; then
     # Silent mode: output only to file (original behavior)
+    info "Running $name agent ${DIM}(quiet mode)${NC}..."
     if claude -p \
       --dangerously-skip-permissions \
       "$prompt" \
@@ -369,22 +483,21 @@ run_phase() {
       exit 1
     fi
   else
-    # Live mode: stream output to terminal AND save to file
+    # Live mode: stream tool calls and text via stream processor
     echo ""
-    info "─── $name output ───"
-    echo ""
-    if claude -p \
+    if claude -p --verbose \
+      --output-format stream-json \
       --dangerously-skip-permissions \
       "$prompt" \
-      2>>"$LOG_FILE" | tee "$output_file"; then
-      echo ""
-      info "─── end $name output ───"
+      2>>"$LOG_FILE" | python3 "$SCRIPT_DIR/stream_processor.py" \
+        "$output_file" "$name" "$SESSION_FILE"; then
       local elapsed=$(( SECONDS - start_time ))
-      ok "$name completed in ${elapsed}s — output saved: $output_file"
+      echo ""
+      ok "$name completed in ${elapsed}s — saved: ${DIM}$output_file${NC}"
       log "$name completed in ${elapsed}s"
     else
-      echo ""
       local elapsed=$(( SECONDS - start_time ))
+      echo ""
       err "$name failed after ${elapsed}s. Check $LOG_FILE for details."
       log "$name FAILED after ${elapsed}s"
       exit 1
@@ -442,7 +555,7 @@ External dependencies, potential breaking changes, areas of concern.
 High-level recommendation for how to approach the task given the codebase structure.
 PROMPT
   )
-  run_phase "Structurer" "$prompt" "$HARNESS_DIR/structure.md"
+  run_phase "Structurer" "$prompt" "$HARNESS_DIR/structure.md" "$CURRENT_PHASE" "$TOTAL_PHASES"
 }
 
 # =============================================================================
@@ -507,7 +620,7 @@ What tests to add or modify, and how to run the full test suite.
 What to watch out for if something goes wrong.
 PROMPT
   )
-  run_phase "Planner" "$prompt" "$HARNESS_DIR/plan.md"
+  run_phase "Planner" "$prompt" "$HARNESS_DIR/plan.md" "$CURRENT_PHASE" "$TOTAL_PHASES"
 }
 
 # =============================================================================
@@ -576,7 +689,7 @@ Any places where you deviated from the plan and why.
 Anything the QA agent should pay special attention to.
 PROMPT
   )
-  run_phase "Builder" "$prompt" "$HARNESS_DIR/build-result.md"
+  run_phase "Builder" "$prompt" "$HARNESS_DIR/build-result.md" "$CURRENT_PHASE" "$TOTAL_PHASES"
 }
 
 # =============================================================================
@@ -662,7 +775,7 @@ Full test output or summary.
 Is this ready to merge? Any caveats?
 PROMPT
   )
-  run_phase "QA" "$prompt" "$HARNESS_DIR/qa-report.md"
+  run_phase "QA" "$prompt" "$HARNESS_DIR/qa-report.md" "$CURRENT_PHASE" "$TOTAL_PHASES"
 }
 
 # =============================================================================
@@ -676,38 +789,170 @@ elif [[ -f "$HARNESS_DIR/task.txt" ]]; then
   TASK=$(cat "$HARNESS_DIR/task.txt")
 fi
 
+# Determine run mode
+RUN_MODE="full"
+$PLAN_ONLY && RUN_MODE="plan-only"
+$SKIP_PLAN && RUN_MODE="build"
+$BUILDER_ONLY && RUN_MODE="builder-only"
+$QA_ONLY && RUN_MODE="qa"
+
 # Log to history if invoked from CLI (interactive mode logs its own)
 if [[ -n "$TASK" && ! -f "$HARNESS_DIR/.interactive" ]]; then
-  local_mode="full"
-  $PLAN_ONLY && local_mode="plan-only"
-  $SKIP_PLAN && local_mode="build"
-  $BUILDER_ONLY && local_mode="builder-only"
-  $QA_ONLY && local_mode="qa"
-  history_add "$local_mode" "$TASK"
+  history_add "$RUN_MODE" "$TASK"
 fi
 
+# --- Compute total phases and set up session ----------------------------------
+TOTAL_PHASES=4
+CURRENT_PHASE=0
+if $QA_ONLY; then TOTAL_PHASES=1
+elif $BUILDER_ONLY; then TOTAL_PHASES=1
+elif $SKIP_PLAN; then TOTAL_PHASES=2
+elif $PLAN_ONLY; then TOTAL_PHASES=2
+fi
+
+# Create session file
+mkdir -p "$SESSIONS_DIR"
+SESSION_FILE="$SESSIONS_DIR/${TIMESTAMP}.json"
+python3 -c "
+import json, os, sys
+session = {
+    'task': sys.argv[1],
+    'mode': sys.argv[2],
+    'started': sys.argv[3],
+    'cwd': os.getcwd(),
+    'phases': []
+}
+with open(sys.argv[4], 'w') as f:
+    json.dump(session, f, indent=2)
+" "$TASK" "$RUN_MODE" "$TIMESTAMP" "$SESSION_FILE"
+
+RUN_START=$SECONDS
+
+# --- Execute pipeline ---------------------------------------------------------
 if $QA_ONLY; then
-  run_qa
+  CURRENT_PHASE=1; run_qa
 elif $BUILDER_ONLY; then
-  run_builder
+  CURRENT_PHASE=1; run_builder
 elif $SKIP_PLAN; then
-  run_builder
-  run_qa
+  CURRENT_PHASE=1; run_builder
+  CURRENT_PHASE=2; run_qa
 elif $PLAN_ONLY; then
-  run_structurer
-  run_planner
-  ok "Plan complete. Review $HARNESS_DIR/plan.md then run: ./harness.sh --skip-plan"
+  CURRENT_PHASE=1; run_structurer
+  CURRENT_PHASE=2; run_planner
 else
-  run_structurer
-  run_planner
-  run_builder
-  run_qa
+  CURRENT_PHASE=1; run_structurer
+  CURRENT_PHASE=2; run_planner
+  CURRENT_PHASE=3; run_builder
+  CURRENT_PHASE=4; run_qa
 fi
 
-phase "Done"
-ok "Harness run complete. Artifacts in $HARNESS_DIR/"
-info "  Structure:    $HARNESS_DIR/structure.md"
-info "  Plan:         $HARNESS_DIR/plan.md"
-info "  Build result: $HARNESS_DIR/build-result.md"
-info "  QA report:    $HARNESS_DIR/qa-report.md"
-info "  Log:          $LOG_FILE"
+# --- Finalize session ---------------------------------------------------------
+TOTAL_ELAPSED=$(( SECONDS - RUN_START ))
+
+# Extract QA verdict if qa-report exists
+QA_VERDICT="--"
+if [[ -f "$HARNESS_DIR/qa-report.md" ]]; then
+  QA_VERDICT=$(grep -oEi '(PASS|FAIL)' "$HARNESS_DIR/qa-report.md" | head -1 || echo "--")
+  [[ -z "$QA_VERDICT" ]] && QA_VERDICT="--"
+fi
+
+# Update session file with totals
+python3 -c "
+import json, sys
+try:
+    sf, elapsed, verdict = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    with open(sf, 'r') as f:
+        session = json.load(f)
+    session['total_duration_s'] = elapsed
+    total_cost = sum(p.get('cost_usd', 0) for p in session.get('phases', []))
+    session['total_cost_usd'] = round(total_cost, 6)
+    session['qa_verdict'] = verdict
+    with open(sf, 'w') as f:
+        json.dump(session, f, indent=2)
+except Exception:
+    pass
+" "$SESSION_FILE" "$TOTAL_ELAPSED" "$QA_VERDICT"
+
+# --- Summary card -------------------------------------------------------------
+# Format duration nicely
+if [[ $TOTAL_ELAPSED -ge 60 ]]; then
+  DURATION_FMT="$(( TOTAL_ELAPSED / 60 ))m$(( TOTAL_ELAPSED % 60 ))s"
+else
+  DURATION_FMT="${TOTAL_ELAPSED}s"
+fi
+
+# Read total cost from session
+TOTAL_COST=$(python3 -c "
+import json
+try:
+    with open('$SESSION_FILE') as f:
+        s = json.load(f)
+    print(f\"\${s.get('total_cost_usd', 0):.4f}\")
+except: print('\$0.0000')
+" 2>/dev/null)
+
+# Colorize QA verdict
+QA_COLOR="$DIM"
+if [[ "$QA_VERDICT" == "PASS" ]]; then QA_COLOR="$BRIGHT_GREEN"
+elif [[ "$QA_VERDICT" == "FAIL" ]]; then QA_COLOR="$BRIGHT_RED"
+fi
+
+echo ""
+echo -e "  ${WHITE}┌─ Run complete ────────────────────────────────┐${NC}"
+echo -e "  ${WHITE}│${NC}                                                ${WHITE}│${NC}"
+echo -e "  ${WHITE}│${NC}  ${BOLD}Task:${NC}    $(printf '%-39s' "$TASK" | head -c 39)  ${WHITE}│${NC}"
+echo -e "  ${WHITE}│${NC}  ${BOLD}Phases:${NC}  $TOTAL_PHASES/$TOTAL_PHASES      ${BOLD}Time:${NC} $(printf '%-13s' "$DURATION_FMT")  ${WHITE}│${NC}"
+echo -e "  ${WHITE}│${NC}  ${BOLD}Cost:${NC}    $(printf '%-12s' "$TOTAL_COST")${BOLD}QA:${NC}   ${QA_COLOR}$(printf '%-13s' "$QA_VERDICT")${NC}  ${WHITE}│${NC}"
+echo -e "  ${WHITE}│${NC}                                                ${WHITE}│${NC}"
+
+# Artifact dots
+ARTIFACTS_LINE=""
+for artifact in structure.md plan.md build-result.md qa-report.md; do
+  if [[ -f "$HARNESS_DIR/$artifact" ]]; then
+    ARTIFACTS_LINE+="  ${GREEN}●${NC} $artifact"
+  else
+    ARTIFACTS_LINE+="  ${DIM}○ $artifact${NC}"
+  fi
+done
+echo -e "  ${WHITE}│${NC} ${ARTIFACTS_LINE}  ${WHITE}│${NC}"
+echo -e "  ${WHITE}│${NC}                                                ${WHITE}│${NC}"
+echo -e "  ${WHITE}└────────────────────────────────────────────────┘${NC}"
+
+# --- Suggested next steps -----------------------------------------------------
+show_next_steps() {
+  local steps=()
+
+  if $PLAN_ONLY; then
+    steps+=("Review plan:     ${CYAN}cat $HARNESS_DIR/plan.md${NC}")
+    steps+=("Execute plan:    ${CYAN}harness --skip-plan${NC}")
+  elif [[ "$QA_VERDICT" == "PASS" ]]; then
+    steps+=("Review changes:  ${CYAN}git diff${NC}")
+    steps+=("Commit:          ${CYAN}git add -p && git commit${NC}")
+  elif [[ "$QA_VERDICT" == "FAIL" ]]; then
+    steps+=("Check report:    ${CYAN}cat $HARNESS_DIR/qa-report.md${NC}")
+    steps+=("Re-run QA:       ${CYAN}harness --qa-only${NC}")
+    steps+=("Retry build:     ${CYAN}harness --builder-only${NC}")
+  elif $BUILDER_ONLY; then
+    steps+=("Run QA:          ${CYAN}harness --qa-only${NC}")
+  elif $QA_ONLY; then
+    if [[ "$QA_VERDICT" == "PASS" ]]; then
+      steps+=("Review changes:  ${CYAN}git diff${NC}")
+      steps+=("Commit:          ${CYAN}git add -p && git commit${NC}")
+    else
+      steps+=("Fix and retry:   ${CYAN}harness --builder-only${NC}")
+    fi
+  else
+    steps+=("Review changes:  ${CYAN}git diff${NC}")
+    steps+=("View artifacts:  ${CYAN}harness${NC}  ${DIM}(interactive menu)${NC}")
+  fi
+
+  echo ""
+  echo -e "  ${WHITE}┌─ Next steps ───────────────────────────────────┐${NC}"
+  for step in "${steps[@]}"; do
+    echo -e "  ${WHITE}│${NC}  $step"
+  done
+  echo -e "  ${WHITE}└────────────────────────────────────────────────┘${NC}"
+  echo ""
+}
+
+show_next_steps

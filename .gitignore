@@ -1,6 +1,10 @@
 # Harness run log (always ignore — noisy, regenerated each run)
 .harness/run.log
 
+# Session data (personal, not for version control)
+.harness/sessions/
+.harness/history.log
+
 # Harness artifacts — uncomment to ignore all working state
 # .harness/structure.md
 # .harness/plan.md
